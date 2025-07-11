@@ -7,13 +7,18 @@
 (define-constant ERR_CONTENT_NOT_FOUND (err u105))
 (define-constant ERR_ALREADY_EXISTS (err u106))
 (define-constant ERR_PAYMENT_FAILED (err u107))
+(define-constant ERR_SUBSCRIPTION_NOT_FOUND (err u108))
+(define-constant ERR_SUBSCRIPTION_EXPIRED (err u109))
+(define-constant ERR_SUBSCRIPTION_ALREADY_ACTIVE (err u110))
 
 (define-map creators
   { creator: principal }
   { 
     total-earned: uint,
     content-count: uint,
-    is-active: bool
+    is-active: bool,
+    subscription-price: uint,
+    subscription-enabled: bool
   }
 )
 
@@ -42,6 +47,16 @@
   }
 )
 
+(define-map subscriptions
+  { subscriber: principal, creator: principal }
+  {
+    start-time: uint,
+    end-time: uint,
+    price-paid: uint,
+    is-active: bool
+  }
+)
+
 (define-data-var next-content-id uint u1)
 (define-data-var next-sale-id uint u1)
 (define-data-var platform-fee-percentage uint u250)
@@ -56,7 +71,9 @@
         {
           total-earned: u0,
           content-count: u0,
-          is-active: true
+          is-active: true,
+          subscription-price: u0,
+          subscription-enabled: false
         }
       ))
     )
@@ -265,5 +282,115 @@
   (match (map-get? content-items { content-id: content-id })
     content (ok (/ (* sale-price (get royalty-percentage content)) u10000))
     ERR_CONTENT_NOT_FOUND
+  )
+)
+
+(define-public (set-subscription-price (price uint))
+  (let ((creator tx-sender))
+    (asserts! (is-some (map-get? creators { creator: creator })) ERR_CREATOR_NOT_FOUND)
+    (asserts! (> price u0) ERR_INVALID_AMOUNT)
+    (map-set creators
+      { creator: creator }
+      (merge 
+        (unwrap-panic (map-get? creators { creator: creator }))
+        { subscription-price: price, subscription-enabled: true }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (subscribe-to-creator (creator principal))
+  (let (
+    (subscriber tx-sender)
+    (creator-info (unwrap! (map-get? creators { creator: creator }) ERR_CREATOR_NOT_FOUND))
+    (subscription-price (get subscription-price creator-info))
+    (current-time stacks-block-height)
+    (subscription-duration u4320)
+  )
+    (asserts! (get subscription-enabled creator-info) ERR_CREATOR_NOT_FOUND)
+    (asserts! (> subscription-price u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= (stx-get-balance subscriber) subscription-price) ERR_INSUFFICIENT_BALANCE)
+    
+    (match (map-get? subscriptions { subscriber: subscriber, creator: creator })
+      existing-subscription (asserts! (not (get is-active existing-subscription)) ERR_SUBSCRIPTION_ALREADY_ACTIVE)
+      true
+    )
+    
+    (let (
+      (platform-fee (/ (* subscription-price (var-get platform-fee-percentage)) u10000))
+      (creator-payment (- subscription-price platform-fee))
+      (end-time (+ current-time subscription-duration))
+    )
+      (try! (stx-transfer? creator-payment subscriber creator))
+      
+      (if (> platform-fee u0)
+        (try! (stx-transfer? platform-fee subscriber CONTRACT_OWNER))
+        true
+      )
+      
+      (map-set subscriptions
+        { subscriber: subscriber, creator: creator }
+        {
+          start-time: current-time,
+          end-time: end-time,
+          price-paid: subscription-price,
+          is-active: true
+        }
+      )
+      
+      (map-set creators
+        { creator: creator }
+        (merge creator-info
+          { total-earned: (+ (get total-earned creator-info) creator-payment) }
+        )
+      )
+      
+      (var-set total-platform-revenue (+ (var-get total-platform-revenue) platform-fee))
+      (ok true)
+    )
+  )
+)
+
+(define-public (cancel-subscription (creator principal))
+  (let (
+    (subscriber tx-sender)
+    (subscription (unwrap! (map-get? subscriptions { subscriber: subscriber, creator: creator }) ERR_SUBSCRIPTION_NOT_FOUND))
+  )
+    (asserts! (get is-active subscription) ERR_SUBSCRIPTION_NOT_FOUND)
+    (map-set subscriptions
+      { subscriber: subscriber, creator: creator }
+      (merge subscription { is-active: false })
+    )
+    (ok true)
+  )
+)
+
+(define-public (access-subscription-content (content-id uint))
+  (let (
+    (subscriber tx-sender)
+    (content (unwrap! (map-get? content-items { content-id: content-id }) ERR_CONTENT_NOT_FOUND))
+    (creator (get creator content))
+    (subscription (unwrap! (map-get? subscriptions { subscriber: subscriber, creator: creator }) ERR_SUBSCRIPTION_NOT_FOUND))
+    (current-time stacks-block-height)
+  )
+    (asserts! (get is-active content) ERR_CONTENT_NOT_FOUND)
+    (asserts! (get is-active subscription) ERR_SUBSCRIPTION_EXPIRED)
+    (asserts! (< current-time (get end-time subscription)) ERR_SUBSCRIPTION_EXPIRED)
+    (ok true)
+  )
+)
+
+(define-read-only (get-subscription-info (subscriber principal) (creator principal))
+  (map-get? subscriptions { subscriber: subscriber, creator: creator })
+)
+
+(define-read-only (is-subscription-active (subscriber principal) (creator principal))
+  (match (map-get? subscriptions { subscriber: subscriber, creator: creator })
+    subscription (and 
+      (get is-active subscription)
+      (< stacks-block-height (get end-time subscription))
+    )
+    false
   )
 )
