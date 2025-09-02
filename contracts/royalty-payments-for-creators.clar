@@ -13,6 +13,11 @@
 (define-constant ERR_TIP_TOO_SMALL (err u111))
 (define-constant ERR_BATCH_TOO_LARGE (err u112))
 (define-constant ERR_BATCH_EMPTY (err u113))
+(define-constant ERR_INVALID_COLLABORATION (err u114))
+(define-constant ERR_COLLABORATION_EXISTS (err u115))
+(define-constant ERR_INVALID_SHARE_TOTAL (err u116))
+(define-constant ERR_TOO_MANY_COLLABORATORS (err u117))
+(define-constant ERR_COLLABORATION_NOT_FOUND (err u118))
 
 (define-map creators
   { creator: principal }
@@ -36,7 +41,8 @@
     royalty-percentage: uint,
     total-sales: uint,
     total-revenue: uint,
-    is-active: bool
+    is-active: bool,
+    collaboration-id: (optional uint)
   }
 )
 
@@ -73,12 +79,24 @@
   }
 )
 
+(define-map collaborations
+  { collaboration-id: uint }
+  {
+    initiator: principal,
+    collaborators: (list 5 principal),
+    shares: (list 5 uint),
+    total-collaborators: uint,
+    is-active: bool
+  }
+)
+
 (define-data-var next-content-id uint u1)
 (define-data-var next-sale-id uint u1)
 (define-data-var next-tip-id uint u1)
 (define-data-var platform-fee-percentage uint u250)
 (define-data-var total-platform-revenue uint u0)
 (define-data-var batch-active-status bool false)
+(define-data-var next-collaboration-id uint u1)
 
 (define-public (register-creator)
   (let ((creator tx-sender))
@@ -118,7 +136,8 @@
         royalty-percentage: royalty-percentage,
         total-sales: u0,
         total-revenue: u0,
-        is-active: true
+        is-active: true,
+        collaboration-id: none
       }
     )
     
@@ -153,7 +172,10 @@
       (royalty-amount (/ (* price royalty-percentage) u10000))
       (creator-payment (- price platform-fee))
     )
-      (try! (stx-transfer? creator-payment buyer creator))
+      (match (get collaboration-id content)
+        collaboration-id (try! (process-collaborative-payment content-id buyer creator-payment))
+        (try! (stx-transfer? creator-payment buyer creator))
+      )
       
       (if (> platform-fee u0)
         (try! (stx-transfer? platform-fee buyer CONTRACT_OWNER))
@@ -180,11 +202,14 @@
         })
       )
       
-      (map-set creators
-        { creator: creator }
-        (merge 
-          (unwrap-panic (map-get? creators { creator: creator }))
-          { total-earned: (+ (get total-earned (unwrap-panic (map-get? creators { creator: creator }))) creator-payment) }
+      (match (get collaboration-id content)
+        collaboration-id-val true
+        (map-set creators
+          { creator: creator }
+          (merge 
+            (unwrap-panic (map-get? creators { creator: creator }))
+            { total-earned: (+ (get total-earned (unwrap-panic (map-get? creators { creator: creator }))) creator-payment) }
+          )
         )
       )
       
@@ -598,4 +623,140 @@
     max-batch-size: u20,
     min-batch-size: u1
   }
+)
+
+(define-public (create-collaboration (collaborators (list 5 principal)) (shares (list 5 uint)))
+  (let (
+    (initiator tx-sender)
+    (collaboration-id (var-get next-collaboration-id))
+    (total-collaborators (len collaborators))
+    (total-shares (fold + shares u0))
+  )
+    (asserts! (> total-collaborators u0) ERR_INVALID_COLLABORATION)
+    (asserts! (<= total-collaborators u5) ERR_TOO_MANY_COLLABORATORS)
+    (asserts! (is-eq total-shares u10000) ERR_INVALID_SHARE_TOTAL)
+    (asserts! (is-eq (len collaborators) (len shares)) ERR_INVALID_COLLABORATION)
+    (asserts! (is-some (map-get? creators { creator: initiator })) ERR_CREATOR_NOT_FOUND)
+    
+    (map-set collaborations
+      { collaboration-id: collaboration-id }
+      {
+        initiator: initiator,
+        collaborators: collaborators,
+        shares: shares,
+        total-collaborators: total-collaborators,
+        is-active: true
+      }
+    )
+    
+    (var-set next-collaboration-id (+ collaboration-id u1))
+    (ok collaboration-id)
+  )
+)
+
+(define-public (create-collaborative-content (title (string-ascii 100)) (price uint) (royalty-percentage uint) (collaboration-id uint))
+  (let (
+    (creator tx-sender)
+    (content-id (var-get next-content-id))
+    (collaboration (unwrap! (map-get? collaborations { collaboration-id: collaboration-id }) ERR_COLLABORATION_NOT_FOUND))
+  )
+    (asserts! (> price u0) ERR_INVALID_AMOUNT)
+    (asserts! (<= royalty-percentage u10000) ERR_INVALID_PERCENTAGE)
+    (asserts! (is-some (map-get? creators { creator: creator })) ERR_CREATOR_NOT_FOUND)
+    (asserts! (get is-active collaboration) ERR_COLLABORATION_NOT_FOUND)
+    (asserts! (or (is-eq creator (get initiator collaboration)) (is-some (index-of (get collaborators collaboration) creator))) ERR_NOT_AUTHORIZED)
+    
+    (map-set content-items
+      { content-id: content-id }
+      {
+        creator: creator,
+        title: title,
+        price: price,
+        royalty-percentage: royalty-percentage,
+        total-sales: u0,
+        total-revenue: u0,
+        is-active: true,
+        collaboration-id: (some collaboration-id)
+      }
+    )
+    
+    (map-set creators
+      { creator: creator }
+      (merge 
+        (unwrap-panic (map-get? creators { creator: creator }))
+        { content-count: (+ (get content-count (unwrap-panic (map-get? creators { creator: creator }))) u1) }
+      )
+    )
+    
+    (var-set next-content-id (+ content-id u1))
+    (ok content-id)
+  )
+)
+
+(define-private (distribute-to-collaborator-at-index (collaboration-id uint) (total-payment uint) (index uint))
+  (let (
+    (collaboration (unwrap-panic (map-get? collaborations { collaboration-id: collaboration-id })))
+    (collaborators (get collaborators collaboration))
+    (shares (get shares collaboration))
+    (collaborator-opt (element-at collaborators index))
+    (share-opt (element-at shares index))
+  )
+    (match collaborator-opt
+      collaborator (match share-opt
+        share (let (
+          (payment-amount (/ (* total-payment share) u10000))
+        )
+          (if (> payment-amount u0)
+            (begin
+              (try! (stx-transfer? payment-amount tx-sender collaborator))
+              (match (map-get? creators { creator: collaborator })
+                existing-creator (map-set creators
+                  { creator: collaborator }
+                  (merge existing-creator { total-earned: (+ (get total-earned existing-creator) payment-amount) })
+                )
+                (map-set creators
+                  { creator: collaborator }
+                  { total-earned: payment-amount, content-count: u0, is-active: true, subscription-price: u0, subscription-enabled: false, total-tips-received: u0, tip-count: u0 }
+                )
+              )
+              (ok true)
+            )
+            (ok true)
+          )
+        )
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-private (process-collaborative-payment (content-id uint) (buyer principal) (total-payment uint))
+  (let (
+    (content (unwrap-panic (map-get? content-items { content-id: content-id })))
+    (collaboration-id-opt (get collaboration-id content))
+  )
+    (match collaboration-id-opt
+      collaboration-id (begin
+        (try! (distribute-to-collaborator-at-index collaboration-id total-payment u0))
+        (try! (distribute-to-collaborator-at-index collaboration-id total-payment u1))
+        (try! (distribute-to-collaborator-at-index collaboration-id total-payment u2))
+        (try! (distribute-to-collaborator-at-index collaboration-id total-payment u3))
+        (try! (distribute-to-collaborator-at-index collaboration-id total-payment u4))
+        (ok true)
+      )
+      (ok true)
+    )
+  )
+)
+
+(define-read-only (get-collaboration-info (collaboration-id uint))
+  (map-get? collaborations { collaboration-id: collaboration-id })
+)
+
+(define-read-only (is-content-collaborative (content-id uint))
+  (match (map-get? content-items { content-id: content-id })
+    content (is-some (get collaboration-id content))
+    false
+  )
 )
