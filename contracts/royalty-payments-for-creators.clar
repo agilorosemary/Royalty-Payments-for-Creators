@@ -18,6 +18,10 @@
 (define-constant ERR_INVALID_SHARE_TOTAL (err u116))
 (define-constant ERR_TOO_MANY_COLLABORATORS (err u117))
 (define-constant ERR_COLLABORATION_NOT_FOUND (err u118))
+(define-constant ERR_LICENSE_NOT_FOUND (err u119))
+(define-constant ERR_LICENSE_ALREADY_EXISTS (err u120))
+(define-constant ERR_INVALID_LICENSE_TYPE (err u121))
+(define-constant ERR_LICENSE_ALREADY_OWNED (err u122))
 
 (define-map creators
   { creator: principal }
@@ -87,6 +91,24 @@
     shares: (list 5 uint),
     total-collaborators: uint,
     is-active: bool
+  }
+)
+
+(define-map content-licenses
+  { content-id: uint, license-type: uint }
+  {
+    license-name: (string-ascii 50),
+    price: uint,
+    is-active: bool,
+    total-sales: uint
+  }
+)
+
+(define-map license-ownership
+  { content-id: uint, license-type: uint, owner: principal }
+  {
+    purchase-date: uint,
+    purchase-price: uint
   }
 )
 
@@ -758,5 +780,138 @@
   (match (map-get? content-items { content-id: content-id })
     content (is-some (get collaboration-id content))
     false
+  )
+)
+
+(define-public (create-license-for-content (content-id uint) (license-type uint) (license-name (string-ascii 50)) (price uint))
+  (let (
+    (creator tx-sender)
+    (content (unwrap! (map-get? content-items { content-id: content-id }) ERR_CONTENT_NOT_FOUND))
+  )
+    (asserts! (is-eq creator (get creator content)) ERR_NOT_AUTHORIZED)
+    (asserts! (> price u0) ERR_INVALID_AMOUNT)
+    (asserts! (< license-type u10) ERR_INVALID_LICENSE_TYPE)
+    (asserts! (is-none (map-get? content-licenses { content-id: content-id, license-type: license-type })) ERR_LICENSE_ALREADY_EXISTS)
+    
+    (map-set content-licenses
+      { content-id: content-id, license-type: license-type }
+      {
+        license-name: license-name,
+        price: price,
+        is-active: true,
+        total-sales: u0
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (purchase-license (content-id uint) (license-type uint))
+  (let (
+    (buyer tx-sender)
+    (content (unwrap! (map-get? content-items { content-id: content-id }) ERR_CONTENT_NOT_FOUND))
+    (license (unwrap! (map-get? content-licenses { content-id: content-id, license-type: license-type }) ERR_LICENSE_NOT_FOUND))
+    (creator (get creator content))
+    (license-price (get price license))
+    (platform-fee-percentage-val (var-get platform-fee-percentage))
+  )
+    (asserts! (get is-active content) ERR_CONTENT_NOT_FOUND)
+    (asserts! (get is-active license) ERR_LICENSE_NOT_FOUND)
+    (asserts! (>= (stx-get-balance buyer) license-price) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (is-none (map-get? license-ownership { content-id: content-id, license-type: license-type, owner: buyer })) ERR_LICENSE_ALREADY_OWNED)
+    
+    (let (
+      (platform-fee (/ (* license-price platform-fee-percentage-val) u10000))
+      (creator-payment (- license-price platform-fee))
+    )
+      (match (get collaboration-id content)
+        collaboration-id (try! (process-collaborative-payment content-id buyer creator-payment))
+        (try! (stx-transfer? creator-payment buyer creator))
+      )
+      
+      (if (> platform-fee u0)
+        (try! (stx-transfer? platform-fee buyer CONTRACT_OWNER))
+        true
+      )
+      
+      (map-set license-ownership
+        { content-id: content-id, license-type: license-type, owner: buyer }
+        {
+          purchase-date: stacks-block-height,
+          purchase-price: license-price
+        }
+      )
+      
+      (map-set content-licenses
+        { content-id: content-id, license-type: license-type }
+        (merge license { total-sales: (+ (get total-sales license) u1) })
+      )
+      
+      (match (get collaboration-id content)
+        collaboration-id-val true
+        (map-set creators
+          { creator: creator }
+          (merge 
+            (unwrap-panic (map-get? creators { creator: creator }))
+            { total-earned: (+ (get total-earned (unwrap-panic (map-get? creators { creator: creator }))) creator-payment) }
+          )
+        )
+      )
+      
+      (var-set total-platform-revenue (+ (var-get total-platform-revenue) platform-fee))
+      (ok true)
+    )
+  )
+)
+
+(define-public (toggle-license-status (content-id uint) (license-type uint) (active bool))
+  (let (
+    (creator tx-sender)
+    (content (unwrap! (map-get? content-items { content-id: content-id }) ERR_CONTENT_NOT_FOUND))
+    (license (unwrap! (map-get? content-licenses { content-id: content-id, license-type: license-type }) ERR_LICENSE_NOT_FOUND))
+  )
+    (asserts! (is-eq creator (get creator content)) ERR_NOT_AUTHORIZED)
+    
+    (map-set content-licenses
+      { content-id: content-id, license-type: license-type }
+      (merge license { is-active: active })
+    )
+    (ok true)
+  )
+)
+
+(define-public (update-license-price (content-id uint) (license-type uint) (new-price uint))
+  (let (
+    (creator tx-sender)
+    (content (unwrap! (map-get? content-items { content-id: content-id }) ERR_CONTENT_NOT_FOUND))
+    (license (unwrap! (map-get? content-licenses { content-id: content-id, license-type: license-type }) ERR_LICENSE_NOT_FOUND))
+  )
+    (asserts! (is-eq creator (get creator content)) ERR_NOT_AUTHORIZED)
+    (asserts! (> new-price u0) ERR_INVALID_AMOUNT)
+    
+    (map-set content-licenses
+      { content-id: content-id, license-type: license-type }
+      (merge license { price: new-price })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-license-info (content-id uint) (license-type uint))
+  (map-get? content-licenses { content-id: content-id, license-type: license-type })
+)
+
+(define-read-only (has-license (content-id uint) (license-type uint) (owner principal))
+  (is-some (map-get? license-ownership { content-id: content-id, license-type: license-type, owner: owner }))
+)
+
+(define-read-only (get-license-ownership-info (content-id uint) (license-type uint) (owner principal))
+  (map-get? license-ownership { content-id: content-id, license-type: license-type, owner: owner })
+)
+
+(define-read-only (get-license-purchase-count (content-id uint) (license-type uint))
+  (match (map-get? content-licenses { content-id: content-id, license-type: license-type })
+    license (ok (get total-sales license))
+    ERR_LICENSE_NOT_FOUND
   )
 )
