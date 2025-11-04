@@ -1,4 +1,42 @@
 (define-constant CONTRACT_OWNER tx-sender)
+(define-constant BPS u10000)
+
+(define-map royalty-rate
+  { creator: principal }
+  { rate: uint }
+)
+
+(define-public (set-royalty-rate (creator principal) (rate uint))
+  (if (or (is-eq tx-sender creator) (is-eq tx-sender CONTRACT_OWNER))
+      (if (<= rate BPS)
+          (begin
+            (map-set royalty-rate { creator: creator } { rate: rate })
+            (ok true))
+          (err u101))
+      (err u100)))
+
+(define-read-only (get-royalty-rate (creator principal))
+  (let ((maybe (map-get? royalty-rate { creator: creator })))
+    (if (is-some maybe)
+        (get rate (unwrap-panic maybe))
+        u0)))
+
+(define-public (pay-royalty (creator principal) (sale-amount uint))
+  (let ((maybe (map-get? royalty-rate { creator: creator })))
+    (if (is-some maybe)
+        (let ((rate (get rate (unwrap-panic maybe))))
+          (if (> rate u0)
+              (let ((royalty (/ (* sale-amount rate) BPS)))
+                (if (> royalty u0)
+                    (stx-transfer? royalty tx-sender creator)
+                    (err u103)))
+              (err u102)))
+        (err u102))))
+
+(define-public (pay-fixed-royalty (creator principal) (amount uint))
+  (if (> amount u0)
+      (stx-transfer? amount tx-sender creator)
+      (err u104)))
 (define-constant ERR_NOT_AUTHORIZED (err u100))
 (define-constant ERR_INVALID_AMOUNT (err u101))
 (define-constant ERR_CREATOR_NOT_FOUND (err u102))
